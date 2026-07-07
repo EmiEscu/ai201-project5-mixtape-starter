@@ -1,9 +1,33 @@
-# Codebase Map
+# Mixtape Bug Hunt — Submission Doc
+
+---
+
+## AI Usage
+
+During this project, I used an AI coding assistant (Claude Code) throughout the investigate-fix-document workflow for Bugs #1, #2, and #4.
+
+**Codebase navigation and summarizing**: I asked it to read specific files (`app.py`, `models.py`, `seed_data.py`) and asked it to produce file explanations to better understand the codebase before any bug work started. With such explanations I orient myself in an unfamiliar codebase rather than reading every file cold myself.
 
 
-## File Summary 
+**Reproduction**: For Bug #2 specifically, I explicitly asked for a way to reproduce the bug "like the user" — hitting a live, seeded server with real `curl` requests and real IDs pulled from the database — rather than accepting its first suggestion of a mocked-datetime script alone. 
 
-### `app.py` -- Flask App and DB setup 
+The AI was useful for quickly locating root causes and drafting fixes, but I pushed back on and corrected its approach more than once, and verified its claims myself rather than accepting them at face value:
+
+- For Bug #2, after the fix was in place I independently questioned whether a simpler one-line change (`RECENT_THRESHOLD = timedelta(hours=1)`) would be just as valid as the calendar-day cutoff it had implemented. It laid out the tradeoff honestly (a 1-hour window is closer to true "live" presence but doesn't actually eliminate the boundary bug, just shrinks it), but I made the final call myself, based on the exact wording of the bug report ("only friends who have listened **today**"), that a rolling window would still be the wrong semantic, and confirmed we should keep the calendar-day fix.
+- I asked follow-up questions to verify I understood the fix's actual behavior rather than taking the summary at face value — e.g. asking exactly when a friend would appear as "listening now" under the new cutoff (any listen since UTC midnight, not literal real-time presence), which the AI answered but which I wanted confirmed in my own words before accepting it.
+
+
+I personally ran the reproduction scripts and the full `pytest` suite after each fix to verify the AI's changes actually resolved the reported behavior and didn't regress the other test files, rather than relying solely on its reported test output. I also independently verified specific claims it made (e.g., confirming for myself that `RECENT_THRESHOLD` was genuinely unused elsewhere before treating it as dead code). Lastly, I handled all manual `git` commits.
+
+---
+
+## Codebase Map
+
+---
+
+### File Summary 
+
+#### `app.py` -- Flask App and DB setup 
 
 This file serves as the entry point for the application. It exposes a single public function, `create_app()`, which sets up the Flask app and configures our SQLite database via SQLAlchemy.
 
@@ -19,7 +43,9 @@ It registers four core blueprints, each mounted to a dedicated URL prefix:
 
 To make sure the database is ready at startup, the factory runs `db.create_all()` inside an app context. Note that because this is an API-only backend, we deliberately didn't include a root route (/), meaning a GET / request will return a 404 by design.
 
-### `models.py` -- Defines SQLAlchemy database schema
+---
+
+#### `models.py` -- Defines SQLAlchemy database schema
 
 `models.py` declares all the database tables/entities and their relationships, using UUID strings as primary keys (via `generate_uuid()`).
 
@@ -34,8 +60,9 @@ To make sure the database is ready at startup, the factory runs `db.create_all()
 | **Playlist** | a named, optionally collaborative playlist created by a user, containing songs via `playlist_entries`. |
 | **Notification** | per-user notifications (type, body, read/unread status). |
 
+---
 
-### `seed_data.py` -- Populates the database with realistic test data
+#### `seed_data.py` -- Populates the database with realistic test data
 
 This script is a standalone utility (run via `python seed_data.py`) that wipes and repopulates the database with a consistent set of sample data for local development and testing. It exposes a single function, `seed()`, which does the following:
 
@@ -49,6 +76,8 @@ This script is a standalone utility (run via `python seed_data.py`) that wipes a
 - **Commits and logs a summary**: commits the session and prints counts of users, songs, playlists, and tags created.
 
 The script runs `seed()` automatically when executed directly (`if __name__ == "__main__"`).
+
+---
 
 ### Services files defined 
 
@@ -89,10 +118,11 @@ Handles creating and retrieving notifications, which are generated when friends 
 Handles playlist creation and retrieval logic.
 
 - **`create_playlist(name, created_by_user_id, is_collaborative=True)`** — Validates the creating user exists, then creates and commits a new `Playlist`.
-- **`get_playlist_songs(playlist_id)`** — Returns the songs in a playlist ordered by their position (ascending). Note: as written, this slices off the *last* song in the list (`songs[:-1]`), so it does not actually return all songs in the playlist — likely a bug worth flagging.
+- **`get_playlist_songs(playlist_id)`** — Returns the songs in a playlist ordered by their position (ascending).
 - **`get_playlist(playlist_id)`** — Returns a playlist's own metadata (not its songs) as a dict.
 - **`get_user_playlists(user_id)`** — Returns all playlists created by a given user.
 
+---
 
 ### Route Files Defined
 
@@ -164,8 +194,9 @@ Tests listening-streak logic (`update_listening_streak`, `get_streak`) against a
 - **`test_streak_increments_on_consecutive_day`** — Asserts listening on Monday then Tuesday increments the streak from 1 to 2.
 - **`test_streak_does_not_double_count_same_day`** — Asserts listening twice in the same day (morning and evening) keeps the streak at 1.
 - **`test_streak_resets_after_skipped_day`** — Asserts listening Monday then Wednesday (skipping Tuesday) resets the streak to 1.
-- **`test_streak_increments_on_sunday`** — Asserts listening Saturday then Sunday increments the streak to 2. This exercises the `today.weekday() != 6` special case in `update_listening_streak` (Sunday is weekday 6), verifying that consecutive-day increments still happen correctly on Sundays.
+- **`test_streak_increments_on_sunday`** — Asserts listening Saturday then Sunday increments the streak to 2, verifying that consecutive-day increments happen correctly regardless of which day of the week it is.
 
+---
 
 ## Data Flow
 
@@ -215,6 +246,7 @@ GET /feed/<user_id>/listening-now
 
 Note that adding a song to a *playlist* (`add_to_playlist` in [services/notification_service.py](services/notification_service.py)) is a separate flow that only creates a `Notification` for the original sharer — it does not touch `ListeningEvent` and therefore does not affect this feed.
 
+---
 
 ## Function explanation
 
@@ -241,8 +273,11 @@ A list of dicts (one per friend who has listened to something in the last 24 hou
 - **Deleted/missing Song or User rows**: `db.session.get(User, event.user_id)` and `db.session.get(Song, event.song_id)` assume the referenced rows still exist. If a friend or song was deleted after the event was logged but the `ListeningEvent` row wasn't cleaned up (no cascade delete defined in `models.py`), `friend` or `song` would be `None`, and calling `.to_dict()` on it would raise an `AttributeError`, crashing the request instead of returning a clean result.
 - **Clock skew / seed data timestamps**: since "recent" is defined relative to `datetime.now(timezone.utc)` at call time, events seeded as "30 minutes old" only stay in the feed for a fixed window after seeding — running the function long after seeding (>24h) will make previously-visible events disappear, which can look like a bug in testing/demo contexts but is expected behavior.
 
+---
 
-## Reproduce Bugs
+## Root Cause Analysis — Bug Fixes
+
+Each entry below documents one bug from initial reproduction through the applied fix, covering all five required fields: reproduction steps, navigation strategy, root cause explanation, fix description, and side-effect check.
 
 ### Bug #1: My listening streak keeps resetting
 
@@ -345,4 +380,12 @@ if song.shared_by != user_id:
 ```
 
 To check for side effects, I re-ran `Reproduce_Bugs/repro_missing_rating_notification.py`: notification count went from 0 to 1 with the correct `song_rated` body after a friend rates a shared song. I also checked two boundary cases not covered by the original report: (1) a user rating their own song produces `count: 0` — no self-notification, confirming the guard works; (2) a friend updating an existing rating (rating the same song twice with different scores) still produces a notification each time, since the notification call is unconditional on the save path, not tied to "first rating only." Finally, I ran the full test suite (`tests/test_streaks.py`, `tests/test_search.py`, `tests/test_playlists.py`); the only failures are the same 2 pre-existing, out-of-scope playlist-slicing test failures seen before this fix — no new regressions, and nothing in the test suite exercises notifications directly so none were at risk of breaking.
+
+---
+
+## Commit History
+
+All work was committed to the `bugfix/mixtape` branch, with a separate commit per milestone/bug fix rather than one bundled commit:
+
+![Git log for Mixtape bug fix project](img/git_log_for_MixTape_Bug_fix_project.png)
 
