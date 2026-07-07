@@ -256,7 +256,21 @@ Used a script (`repro_sunday_bug.py`) that spins up the real Flask app with an i
   2. `GET /users/<user_id>/streak` to read back the resulting streak.
 - **Trigger condition**: the bug only fires when `days_since_last == 1` **and** the current day (`today.weekday()`) is a Sunday (`weekday() == 6`). Any other day of the week with a 1-day gap increments correctly.
 - **Result**: streak dropped from 12 to 1, even though the listen was on a consecutive day — reproducing the user's report exactly (including that it only happens on Sundays, and that the next day's listen "starts working again" by incrementing from the reset baseline).
-- **Root cause located**: [services/streak_service.py:73](services/streak_service.py#L73) — `elif days_since_last == 1 and today.weekday() != 6:` — the `today.weekday() != 6` clause incorrectly excludes Sundays from the increment branch, sending them to the `else` reset branch instead.
+- **Root cause located**: `elif days_since_last == 1 and today.weekday() != 6:` — the `today.weekday() != 6` clause incorrectly excludes Sundays from the increment branch, sending them to the `else` reset branch instead.
+
+**How I found the root cause**
+
+Started at [services/streak_service.py](services/streak_service.py) since the symptom ("streak resets") is entirely owned by `update_listening_streak()` — there's no other file that touches `listening_streak`. Read the function top-down: it computes `days_since_last = (today - last_date).days`, then branches on that value (0 = same day/no-op, 1 = increment, otherwise = reset). The `elif` on line 73 read `days_since_last == 1 and today.weekday() != 6`, which stood out immediately because the docstring above the function (lines 46-50) never mentions any day-of-week exception — it just says "if they listened yesterday, increment." That mismatch between the documented rule and the actual condition was the moment I was confident I'd found the real cause, not just a suspicious area: `weekday()` returns 6 for Sunday in Python, so this clause is specifically false on Sundays, forcing every Sunday consecutive-day listen into the `else` reset branch. I confirmed this wasn't a red herring by checking [tests/test_streaks.py](tests/test_streaks.py), which already had `test_streak_increments_on_sunday` — a test written specifically to catch this — and running it showed it failing with `assert 1 == 2`, matching the exact mechanism.
+
+**The root cause**
+
+In `update_listening_streak()` ([services/streak_service.py:73](services/streak_service.py#L73)), the condition for incrementing the streak was `days_since_last == 1 and today.weekday() != 6`. Python's `datetime.weekday()` returns `6` for Sunday, so this extra clause is `False` every Sunday, regardless of whether the listen was actually on a consecutive day. That routes every Sunday listen — even a legitimate one-day gap from Saturday — into the `else` branch, which unconditionally sets `user.listening_streak = 1`. There is no legitimate reason in the streak rules (first listen, same-day, consecutive-day, gap) for the day of the week to matter at all; the clause was extraneous and directly caused the reported behavior of streaks resetting specifically on Sundays.
+
+**My fix and side-effect check**
+
+Removed the `and today.weekday() != 6` clause, leaving `elif days_since_last == 1:` as the sole condition for incrementing the streak — this is the minimal change that aligns the code with the documented streak rules (increment on any true one-day gap, regardless of weekday).
+
+To check for side effects, I ran the full `tests/test_streaks.py` suite: all 5 tests passed, including `test_streak_increments_on_sunday` (the boundary case this fix targets) and `test_streak_resets_after_skipped_day` (confirming genuine gaps still reset correctly — the other side of the boundary). I also re-ran `Reproduce_Bugs/repro_sunday_bug.py`, which now shows the streak going from 12 → 13 on a Saturday-to-Sunday listen instead of resetting to 1. Finally, I ran `tests/test_playlists.py` and `tests/test_search.py` to confirm this change didn't touch unrelated functionality — the only failures there are the pre-existing, out-of-scope playlist-slicing bug, unaffected by this fix.
 
 ### Bug #2: Friends Listening Now shows people from yesterday
 
@@ -273,6 +287,27 @@ Used a script (`repro_sunday_bug.py`) that spins up the real Flask app with an i
 6. **Trigger condition**: any `ListeningEvent.listened_at >= datetime.now(UTC) - timedelta(hours=24)` qualifies — there is no check against the start of the current calendar day, so events from "yesterday evening" remain visible until a full 24 hours have elapsed, not until midnight.
 7. **Root cause located**: [services/feed_service.py:13,32](services/feed_service.py#L13) — `RECENT_THRESHOLD = timedelta(hours=24)` implements a rolling window rather than "since local midnight" / "today," which is what "Listening Now" implies to users. The code behaves exactly as written; the mismatch is between this implementation and user-facing semantics of "today."
 
+**How I found the root cause**
+
+Started at [services/feed_service.py](services/feed_service.py) since `GET /feed/<user_id>/listening-now` is the only route that produces this feed, and it delegates entirely to `get_friends_listening_now()`. Read the function top-down: it computes `cutoff = datetime.now(timezone.utc) - RECENT_THRESHOLD` and filters `ListeningEvent.listened_at >= cutoff` — a single comparison, so there was nowhere else the "yesterday's listen still shows" behavior could be coming from. The moment of confidence came from re-reading `RECENT_THRESHOLD = timedelta(hours=24)` at the top of the file next to the docstring's use of the word "recently" — the code implements "within the last 24 hours" (a rolling window anchored to the exact call time), not "today" (anchored to local midnight). Those are different windows that happen to overlap most of the day, which is why the bug only shows up near the day boundary — exactly the "9am the morning after an 11pm listen" scenario reported. I confirmed this wasn't a red herring by reproducing it against real seeded data (`seed_data.py` creates events 17-26 hours old specifically to exercise this boundary) and watching them appear in `GET /feed/<user_id>/listening-now`.
+
+**The root cause**
+
+`get_friends_listening_now()` computed its recency cutoff as `datetime.now(timezone.utc) - timedelta(hours=24)` ([services/feed_service.py:32](services/feed_service.py#L32)), a rolling 24-hour window measured from the exact moment of the request. "Listening Now" is meant to convey "today," which users interpret as since local/calendar midnight — a boundary that resets once per day, not one that continuously slides forward. Because the cutoff never anchors to the start of a calendar day, any listen from up to 24 hours ago — including one from late the previous evening — still satisfies `listened_at >= cutoff` well into the next morning, which is exactly the reported symptom.
+
+**My fix and side-effect check**
+
+Changed the cutoff in [services/feed_service.py:32](services/feed_service.py#L32) from a rolling 24-hour window to the start of the current UTC calendar day:
+
+```python
+now = datetime.now(timezone.utc)
+cutoff = datetime(now.year, now.month, now.day, tzinfo=timezone.utc)
+```
+
+This is the minimal change needed — it only touches how `cutoff` is computed, leaving the query, dedup logic, and `get_activity_feed()` (which doesn't use this cutoff at all) untouched.
+
+To check for side effects, I re-ran `Reproduce_Bugs/repro_stale_listening_now.py`: darius's 11pm-last-night listen, checked at a simulated 9am, now correctly returns `count: 0` instead of showing him as "listening now." I also wrote and ran a same-day boundary check — a listen at 1am today, checked at 9am the same day — which still correctly returns `count: 1`, confirming the fix only excludes listens from before today, not all older listens within the day. Finally, I ran the full test suite (`tests/test_streaks.py`, `tests/test_search.py`, `tests/test_playlists.py`); the only failures are the same 2 pre-existing, out-of-scope playlist-slicing test failures seen before this fix — no new regressions.
+
 ### Bug #4 — I got notified when a friend added my song to a playlist but not when they rated it
 
 **How I reproduced it**
@@ -287,4 +322,27 @@ Used a script (`repro_sunday_bug.py`) that spins up the real Flask app with an i
 5. **Result**: the rating was persisted (verifiable via the song/rating data) but no new notification was created for nova, reproducing the report exactly — no delay, just nothing, and nothing shows up in `GET /users/<id>/notifications`.
 6. **Trigger condition**: this fires on every rating submitted by a user other than the song's sharer — it's not a conditional/edge-case bug, `rate_song` simply never calls `create_notification` under any circumstance.
 7. **Root cause located**: [services/notification_service.py:73-110](services/notification_service.py#L73-L110) — `rate_song()` is missing a `create_notification(...)` call entirely. This is a missing-feature gap rather than a broken condition; the fix is to add a notification call mirroring the playlist pattern (e.g. `notification_type="song_rated"`), guarded so a user rating their own song doesn't self-notify (`if song.shared_by != user_id`).
+
+**How I found the root cause**
+
+Started at [services/notification_service.py](services/notification_service.py) since it's the single file responsible for all notification creation, and both the working case (playlist adds) and broken case (ratings) live in it side by side. Read `add_to_playlist()` first since it's the known-working reference pattern the codebase map calls out: it does the mutation (append song to playlist), commits, then conditionally calls `create_notification(user_id=song.shared_by, ...)` guarded by `if song.shared_by != added_by_user_id`. Read `rate_song()` immediately after with that pattern fresh in mind — it does the mutation (upsert `Rating`), commits, and returns. There is no third step. The moment of confidence was structural, not speculative: `rate_song()` never references `create_notification` anywhere in its body, and grepping the file confirmed `create_notification` is called from exactly one place (`add_to_playlist`). This isn't a broken condition I had to trace through several branches to find — the call is simply absent, so there's no deeper "why" to chase beyond confirming no other code path notifies on rating (checked [routes/songs.py](routes/songs.py)'s `POST /<song_id>/rate` route, which calls `rate_song` directly and does nothing else).
+
+**The root cause**
+
+`rate_song()` in [services/notification_service.py:73-110](services/notification_service.py#L73-L110) persists the `Rating` row (insert or update) and commits, but never calls `create_notification()` for the song's original sharer. This is unlike `add_to_playlist()`, which explicitly notifies `song.shared_by` after a successful playlist add. There's no missing condition or off-by-one check to fix — the notification step for ratings was simply never implemented, so ratings are saved successfully but silently produce zero notifications for anyone, regardless of who rates or how many times.
+
+**My fix and side-effect check**
+
+Added a `create_notification(...)` call at the end of `rate_song()`, after the commit, guarded by `if song.shared_by != user_id` so a user rating their own shared song doesn't notify themselves — mirroring the exact guard pattern used in `add_to_playlist()`:
+
+```python
+if song.shared_by != user_id:
+    create_notification(
+        user_id=song.shared_by,
+        notification_type="song_rated",
+        body=f"{rater.username} rated your song '{song.title}' {score} stars.",
+    )
+```
+
+To check for side effects, I re-ran `Reproduce_Bugs/repro_missing_rating_notification.py`: notification count went from 0 to 1 with the correct `song_rated` body after a friend rates a shared song. I also checked two boundary cases not covered by the original report: (1) a user rating their own song produces `count: 0` — no self-notification, confirming the guard works; (2) a friend updating an existing rating (rating the same song twice with different scores) still produces a notification each time, since the notification call is unconditional on the save path, not tied to "first rating only." Finally, I ran the full test suite (`tests/test_streaks.py`, `tests/test_search.py`, `tests/test_playlists.py`); the only failures are the same 2 pre-existing, out-of-scope playlist-slicing test failures seen before this fix — no new regressions, and nothing in the test suite exercises notifications directly so none were at risk of breaking.
 
