@@ -274,3 +274,17 @@ Used a script (`repro_sunday_bug.py`) that spins up the real Flask app with an i
 7. **Root cause located**: [services/feed_service.py:13,32](services/feed_service.py#L13) — `RECENT_THRESHOLD = timedelta(hours=24)` implements a rolling window rather than "since local midnight" / "today," which is what "Listening Now" implies to users. The code behaves exactly as written; the mismatch is between this implementation and user-facing semantics of "today."
 
 ### Bug #4 — I got notified when a friend added my song to a playlist but not when they rated it
+
+**How I reproduced it**
+
+1. Examined [notification_service.py](services/notification_service.py) and compared `add_to_playlist()` ([notification_service.py:35-70](services/notification_service.py#L35-L70)) against `rate_song()` ([notification_service.py:73-110](services/notification_service.py#L73-L110)). `add_to_playlist` explicitly calls `create_notification(user_id=song.shared_by, notification_type="song_added_to_playlist", ...)` when the adder isn't the original sharer. `rate_song` has no equivalent call anywhere in its body — it only validates the score, upserts the `Rating` row, and commits.
+2. Ran `python seed_data.py` then `python app.py` against a real server, and pulled real IDs directly from the DB: a user who shared a song (nova) and a different user to act as the rater (darius).
+3. **Data condition**: a song shared by nova (`shared_by = nova.id`), and darius is a different user than the sharer — the exact condition under which a notification should fire per the playlist pattern.
+4. **Sequence of actions**:
+   - Checked nova's notifications first: `GET /users/<nova_id>/notifications` → `{"count":1,...}` (only the pre-existing seed `song_added_to_playlist` notification).
+   - Had darius rate nova's song: `POST /songs/<song_id>/rate` with `{"user_id": "<darius_id>", "score": 5}` → `201`, rating saved successfully (confirmed via response body).
+   - Re-checked nova's notifications: `GET /users/<nova_id>/notifications` → still `{"count":1,...}`, byte-for-byte identical to before.
+5. **Result**: the rating was persisted (verifiable via the song/rating data) but no new notification was created for nova, reproducing the report exactly — no delay, just nothing, and nothing shows up in `GET /users/<id>/notifications`.
+6. **Trigger condition**: this fires on every rating submitted by a user other than the song's sharer — it's not a conditional/edge-case bug, `rate_song` simply never calls `create_notification` under any circumstance.
+7. **Root cause located**: [services/notification_service.py:73-110](services/notification_service.py#L73-L110) — `rate_song()` is missing a `create_notification(...)` call entirely. This is a missing-feature gap rather than a broken condition; the fix is to add a notification call mirroring the playlist pattern (e.g. `notification_type="song_rated"`), guarded so a user rating their own song doesn't self-notify (`if song.shared_by != user_id`).
+
