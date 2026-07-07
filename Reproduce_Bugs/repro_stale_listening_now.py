@@ -61,6 +61,3 @@ with app.app_context():
         print(f"GET /feed/{me.id}/listening-now -> {resp.status_code}")
         print(resp.get_json())
 
-    print("\nExpected: darius should NOT appear (his only listen was yesterday evening).")
-    print("Actual: darius appears as 'listening now' because 11pm->9am is only 10 hours,")
-    print("        which is still inside the 24-hour rolling window used as the cutoff.")
