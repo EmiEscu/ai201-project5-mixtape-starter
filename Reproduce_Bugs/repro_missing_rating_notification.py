@@ -52,4 +52,4 @@ with app.app_context():
     print(resp.get_json())
 
     print("\nExpected: count == 1, a notification about the rating.")
-    print("Actual: count == 0 — rate_song() never calls create_notification().")
+    

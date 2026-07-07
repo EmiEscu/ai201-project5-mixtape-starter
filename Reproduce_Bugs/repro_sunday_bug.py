@@ -58,4 +58,4 @@ with app.app_context():
     resp = client.get(f"/users/{me.id}/streak")
     print(f"\nGET /users/{me.id}/streak -> {resp.status_code}")
     print(resp.get_json())
-    print("\nExpected: 13. Actual: bug resets it to 1 because today.weekday() == 6 (Sunday).")
+    print("\nExpected: 13.")
